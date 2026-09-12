@@ -1,5 +1,7 @@
 # ssrf-canary
 
+![ssrf-canary: Out-of-band callback collection](assets/project-mark.svg)
+
 Lightweight self-hosted out-of-band (OOB) callback server for validating blind SSRF, XXE, SSTI, and similar injection classes. Replaces Burp Collaborator in automated security testing pipelines.
 
 ## Features
@@ -137,3 +139,7 @@ ssrf-canary/
       handlers.go            # REST handlers: /token /check/:token /list /clear /ws
   Dockerfile
 ```
+
+## License and maintenance
+
+Maintained by [unrandoms](https://github.com/unrandoms). Distributed under the [MIT License](LICENSE).
