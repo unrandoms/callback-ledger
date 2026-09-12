@@ -1,145 +1,67 @@
-# ssrf-canary
+# callback-ledger
 
-![ssrf-canary: Out-of-band callback collection](assets/project-mark.svg)
+![callback-ledger](assets/project-mark.svg)
 
-Lightweight self-hosted out-of-band (OOB) callback server for validating blind SSRF, XXE, SSTI, and similar injection classes. Replaces Burp Collaborator in automated security testing pipelines.
+Collect HTTP and DNS callbacks under a named test session, then export the observations as JSON or NDJSON. This is a small, self-hosted evidence collector for development and authorized testing.
 
-## Features
+## Build and start
 
-- HTTP listener on configurable port (default 8080) — logs every request, extracts canary tokens from the path, `?token=` query param, or `X-Canary-Token` header
-- DNS server on configurable port (default 5353) using `miekg/dns` — responds to all A queries for `*.DOMAIN` with the server IP
-- Unique token generation per test — each token tracks every callback it receives
-- REST API to poll callback status
-- WebSocket endpoint `/ws` for real-time push notifications
-- Optional TLS support
-
-## Running locally
-
-```
-go install github.com/unrandoms/ssrf-canary@latest
-ssrf-canary --domain canary.yourdomain.com --ip 1.2.3.4
+```sh
+go build -o callback-ledger .
+export CALLBACK_LEDGER_ADMIN_TOKEN="$(openssl rand -hex 32)"
+./callback-ledger --ip 127.0.0.1 --domain canary.example.com --ttl 1h
 ```
 
-Or build from source:
+The example advertises localhost, with HTTP on port 8080 and UDP DNS on port 5353. `--ip` must be an explicit IPv4 address appropriate for your deployment. DNS callbacks from external resolvers require a domain delegated to your server and UDP port 53 routing; the example domain does not establish that routing. The server listens on all interfaces. Use `--tls --cert cert.pem --key key.pem` or a TLS reverse proxy for remote administration.
 
-```
-git clone https://github.com/unrandoms/ssrf-canary
-cd ssrf-canary
-go build -o canary .
-./canary --domain canary.yourdomain.com --ip 1.2.3.4
-```
+## Name a session and collect evidence
 
-Flags:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--http-port` | 8080 | HTTP listener port |
-| `--dns-port` | 5353 | DNS listener port (use 53 with root or CAP_NET_BIND_SERVICE) |
-| `--domain` | canary.example.com | Base domain for DNS callbacks |
-| `--ip` | auto | Public IP advertised in DNS A records |
-| `--tls` | false | Enable HTTPS |
-| `--cert` | | TLS certificate (PEM) |
-| `--key` | | TLS private key (PEM) |
-
-## Running via Docker
-
-```
-docker build -t ssrf-canary .
-docker run -p 8080:8080 -p 5353:5353/udp ssrf-canary \
-  --domain canary.yourdomain.com --ip 1.2.3.4
+```sh
+curl -H "Authorization: Bearer $CALLBACK_LEDGER_ADMIN_TOKEN" \
+  'http://127.0.0.1:8080/token?label=login-check'
 ```
 
-## Pentest workflow
+The response includes `token`, `http_url` and `dns_host`. Send an HTTP request to the returned URL, or a DNS query to the returned hostname through your configured DNS infrastructure. Callbacks do not require the administrator secret.
 
-### 1. Generate a token
+Replace `TOKEN` below with the returned token:
 
-```
-curl http://localhost:8080/token
-```
-
-Response:
-
-```json
-{
-  "token": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-  "http_url": "http://1.2.3.4:8080/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-  "dns_host": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4.canary.yourdomain.com"
-}
+```sh
+curl -H "Authorization: Bearer $CALLBACK_LEDGER_ADMIN_TOKEN" \
+  http://127.0.0.1:8080/export/TOKEN -o evidence.json
+curl -H "Authorization: Bearer $CALLBACK_LEDGER_ADMIN_TOKEN" \
+  'http://127.0.0.1:8080/export/TOKEN?format=ndjson' -o evidence.ndjson
 ```
 
-### 2. Inject the URL or hostname into the target parameter
+JSON exports contain `schema_version: 1` and a session with its label, creation/expiry times, retained requests and dropped-event count. NDJSON starts with a `session` record containing the same metadata, followed by one `callback` record per retained request.
 
-HTTP injection example:
+## API
 
-```
-curl 'https://target.com/fetch?url=http://1.2.3.4:8080/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
-```
+All management routes require the bearer token, including WebSocket upgrades. The secret must be at least 32 characters at startup and is never accepted in a query parameter.
 
-DNS injection example (SSTI, XXE, etc.):
+| Route | Purpose |
+| --- | --- |
+| `GET /token?label=...` | Create a session; label up to 128 bytes, without control characters |
+| `GET /check/TOKEN` | Poll retained callbacks |
+| `GET /export/TOKEN?format=json` | Export a session and its retention metadata |
+| `GET /export/TOKEN?format=ndjson` | Export newline-delimited records |
+| `GET /list` | List active sessions with retention metadata |
+| `POST /clear` | Delete all sessions |
+| `GET /ws` | Receive live retained-callback notifications |
 
-```
-# In a template field, inject something that resolves DNS:
-# ${T(java.net.InetAddress).getByName("a1b2c3...d4.canary.yourdomain.com")}
-```
+## Retention and interpretation
 
-### 3. Poll for callbacks
+Storage is in memory: restart, expiry or `/clear` removes observations. Export before then. At most 1,024 active sessions and the first 64 callbacks per session are retained; subsequent callbacks increment `dropped_events`. Expired sessions cannot be read or receive callbacks, even before cleanup.
 
-```
-curl http://localhost:8080/check/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
-```
+HTTP bodies are limited to 16 KiB and include a `body_truncated` flag. Authorization, proxy authorization and cookie headers are redacted; management requests are excluded from capture. Other headers, URLs and bodies may still contain application data. Source addresses are observed transport peers, which may be proxies or DNS resolvers.
 
-Response when seen:
+An observation establishes that a request reached this collector. It does not by itself prove a vulnerability or identify the originating application. Exports are ordinary JSON records, not signed or tamper-proof evidence. WebSocket notifications are live-only; exports are the retained record. DNS support is UDP with IPv4 answers, not a complete DNS service.
 
-```json
-{
-  "seen": true,
-  "requests": [
-    {
-      "timestamp": "2024-01-15T10:30:00Z",
-      "source_ip": "192.168.1.100:54321",
-      "protocol": "http",
-      "method": "GET",
-      "path": "/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-      "headers": {"User-Agent": "Java/11.0.2"},
-      "body": "",
-      "query": ""
-    }
-  ]
-}
+## Development and history
+
+```sh
+go test -race ./...
 ```
 
-### Other API endpoints
+Tests cover authentication, labeled sessions, expiry, retention overflow, evidence isolation, export formats, body truncation, header redaction and DNS domain matching.
 
-```
-# List all active tokens
-curl http://localhost:8080/list
-
-# Clear all tokens
-curl -X POST http://localhost:8080/clear
-
-# WebSocket real-time stream
-wscat -c ws://localhost:8080/ws
-```
-
-## Architecture
-
-```
-ssrf-canary/
-  main.go                    # entry point
-  cmd/root.go                # cobra CLI flags
-  internal/
-    server/
-      server.go              # goroutine launcher
-      http.go                # HTTP listener + token extraction middleware
-      dns.go                 # DNS server (miekg/dns)
-      websocket.go           # WebSocket hub
-    store/
-      store.go               # in-memory token store with TTL
-    api/
-      handlers.go            # REST handlers: /token /check/:token /list /clear /ws
-  Dockerfile
-```
-
-## License and maintenance
-
-Maintained by [unrandoms](https://github.com/unrandoms). Distributed under the [MIT License](LICENSE).
+Maintained by [unrandoms](https://github.com/unrandoms) under the [MIT License](LICENSE). This project evolves the existing `ssrf-canary` repository; its history remains. The new name reflects session-based evidence collection rather than a claim to replace a commercial testing platform.

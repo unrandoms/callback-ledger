@@ -1,14 +1,17 @@
 package api
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 
-	"github.com/unrandoms/ssrf-canary/internal/server"
-	"github.com/unrandoms/ssrf-canary/internal/store"
+	"github.com/unrandoms/callback-ledger/internal/server"
+	"github.com/unrandoms/callback-ledger/internal/store"
 )
 
 // tokenResponse is returned by GET /token.
@@ -20,14 +23,27 @@ type tokenResponse struct {
 
 // checkResponse is returned by GET /check/:token.
 type checkResponse struct {
-	Seen     bool                  `json:"seen"`
+	Seen     bool                    `json:"seen"`
 	Requests []store.CallbackRequest `json:"requests"`
 }
 
 // NewRouter builds and returns the API ServeMux and the WebSocket hub.
-func NewRouter(s *store.Store, domain, serverIP string, httpPort int, tls bool) (*http.ServeMux, *server.WSHub) {
+func NewRouter(s *store.Store, domain, serverIP string, httpPort int, tls bool, adminToken string) (*http.ServeMux, *server.WSHub) {
 	hub := server.NewWSHub()
 	mux := http.NewServeMux()
+	register := func(path string, handler http.HandlerFunc) {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			expected := sha256.Sum256([]byte("Bearer " + adminToken))
+			supplied := sha256.Sum256([]byte(r.Header.Get("Authorization")))
+			w.Header().Set("Cache-Control", "no-store")
+			if adminToken == "" || subtle.ConstantTimeCompare(expected[:], supplied[:]) != 1 {
+				w.Header().Set("WWW-Authenticate", "Bearer")
+				http.Error(w, "authentication required", http.StatusUnauthorized)
+				return
+			}
+			handler(w, r)
+		})
+	}
 
 	scheme := "http"
 	if tls {
@@ -42,12 +58,23 @@ func NewRouter(s *store.Store, domain, serverIP string, httpPort int, tls bool) 
 	baseURL := fmt.Sprintf("%s://%s:%d", scheme, ip, httpPort)
 
 	// GET /token — mint a new canary token.
-	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+	register("/token", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		token := s.GenerateToken()
+		token, err := s.CreateToken(r.URL.Query().Get("label"))
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, store.ErrLabel) {
+				status = http.StatusBadRequest
+			}
+			if errors.Is(err, store.ErrCapacity) {
+				status = http.StatusTooManyRequests
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
 		resp := tokenResponse{
 			Token:   token,
 			HTTPURL: fmt.Sprintf("%s/%s", baseURL, token),
@@ -58,7 +85,7 @@ func NewRouter(s *store.Store, domain, serverIP string, httpPort int, tls bool) 
 	})
 
 	// GET /check/{token} — poll for callbacks.
-	mux.HandleFunc("/check/", func(w http.ResponseWriter, r *http.Request) {
+	register("/check/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -82,7 +109,7 @@ func NewRouter(s *store.Store, domain, serverIP string, httpPort int, tls bool) 
 	})
 
 	// GET /list — list all tokens and their status.
-	mux.HandleFunc("/list", func(w http.ResponseWriter, r *http.Request) {
+	register("/list", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -92,7 +119,7 @@ func NewRouter(s *store.Store, domain, serverIP string, httpPort int, tls bool) 
 	})
 
 	// POST /clear — remove all tokens.
-	mux.HandleFunc("/clear", func(w http.ResponseWriter, r *http.Request) {
+	register("/clear", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -102,8 +129,42 @@ func NewRouter(s *store.Store, domain, serverIP string, httpPort int, tls bool) 
 		log.Printf("[api] store cleared")
 	})
 
-	// GET /ws — WebSocket upgrade.
-	mux.HandleFunc("/ws", hub.ServeWS)
+	// Exports include retention metadata so a partial record cannot appear complete.
+	register("/export/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		entry, ok := s.Get(strings.TrimPrefix(r.URL.Path, "/export/"))
+		if !ok {
+			http.Error(w, "token not found", 404)
+			return
+		}
+		format := r.URL.Query().Get("format")
+		if format != "" && format != "json" && format != "ndjson" {
+			http.Error(w, "format must be json or ndjson", 400)
+			return
+		}
+		if format == "ndjson" {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			events := entry.Requests
+			entry.Requests = []store.CallbackRequest{}
+			enc := json.NewEncoder(w)
+			if enc.Encode(map[string]interface{}{"type": "session", "schema_version": 1, "session": entry}) != nil {
+				return
+			}
+			for _, event := range events {
+				if enc.Encode(map[string]interface{}{"type": "callback", "request": event}) != nil {
+					return
+				}
+			}
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{"schema_version": 1, "session": entry})
+	})
+
+	// GET /ws — authenticated WebSocket upgrade.
+	register("/ws", hub.ServeWS)
 
 	// Catch-all — used by callback middleware in http.go; return 200 so targets don't retry.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

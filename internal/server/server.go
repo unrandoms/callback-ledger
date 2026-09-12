@@ -3,7 +3,7 @@ package server
 import (
 	"net/http"
 
-	"github.com/unrandoms/ssrf-canary/internal/store"
+	"github.com/unrandoms/callback-ledger/internal/store"
 )
 
 // Config holds all runtime configuration for the server.

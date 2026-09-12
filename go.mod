@@ -1,4 +1,4 @@
-module github.com/unrandoms/ssrf-canary
+module github.com/unrandoms/callback-ledger
 
 go 1.22.0
 

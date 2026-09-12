@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/unrandoms/ssrf-canary/internal/store"
+	"github.com/unrandoms/callback-ledger/internal/store"
 )
 
 // dnsHandler implements dns.Handler and resolves all A queries for *.domain
@@ -41,7 +41,7 @@ func (h *dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 				Protocol:  "dns",
 				Query:     name,
 			}
-			h.store.RecordCallback(token, cb)
+			recorded := h.store.RecordCallback(token, cb)
 
 			event := map[string]interface{}{
 				"type":  "callback",
@@ -53,7 +53,9 @@ func (h *dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 					"timestamp": cb.Timestamp,
 				},
 			}
-			h.hub.Broadcast(event)
+			if recorded {
+				h.hub.Broadcast(event)
+			}
 			log.Printf("[dns] token %s marked seen", token)
 		}
 
@@ -80,7 +82,7 @@ func (h *dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 // and the rest of the name is the configured domain.
 func extractDNSToken(name, domain string) string {
 	suffix := "." + strings.ToLower(domain)
-	if !strings.HasSuffix(name, strings.ToLower(domain)) {
+	if !strings.HasSuffix(name, suffix) {
 		return ""
 	}
 	label := strings.TrimSuffix(name, suffix)
@@ -95,23 +97,11 @@ func extractDNSToken(name, domain string) string {
 	return ""
 }
 
-// resolvePublicIP attempts to determine the server's outbound IP.
-func resolvePublicIP() net.IP {
-	conn, err := net.Dial("udp", "8.8.8.8:53")
-	if err != nil {
-		return net.IPv4(127, 0, 0, 1)
-	}
-	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP
-}
-
 // startDNS starts the DNS UDP server.
 func startDNS(cfg Config) error {
 	ip := net.ParseIP(cfg.ServerIP)
-	if ip == nil {
-		ip = resolvePublicIP()
-		log.Printf("[dns] auto-detected server IP: %s", ip)
+	if ip == nil || ip.To4() == nil {
+		return fmt.Errorf("--ip requires an IPv4 address")
 	}
 
 	handler := &dnsHandler{

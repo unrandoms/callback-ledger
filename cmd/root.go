@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/unrandoms/ssrf-canary/internal/api"
-	"github.com/unrandoms/ssrf-canary/internal/server"
-	"github.com/unrandoms/ssrf-canary/internal/store"
+	"github.com/unrandoms/callback-ledger/internal/api"
+	"github.com/unrandoms/callback-ledger/internal/server"
+	"github.com/unrandoms/callback-ledger/internal/store"
 )
 
 var (
@@ -18,13 +20,14 @@ var (
 	tlsEnabled bool
 	certFile   string
 	keyFile    string
+	ttl        time.Duration
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "ssrf-canary",
-	Short: "Out-of-band callback server for SSRF, XXE, and SSTI validation",
-	Long: `ssrf-canary is a self-hosted OOB callback server that replaces Burp Collaborator
-in automated security testing. It tracks unique tokens via HTTP and DNS callbacks.`,
+	Use:   "callback-ledger",
+	Short: "Collect labeled HTTP/DNS callbacks and export test evidence",
+	Long: `callback-ledger collects labeled HTTP/DNS callbacks in bounded, expiring sessions.
+Management endpoints require CALLBACK_LEDGER_ADMIN_TOKEN. Export JSON or NDJSON before expiry.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return run()
 	},
@@ -38,17 +41,28 @@ func Execute() {
 }
 
 func init() {
+	rootCmd.Flags().DurationVar(&ttl, "ttl", time.Hour, "Session lifetime")
 	rootCmd.Flags().IntVar(&httpPort, "http-port", 8080, "HTTP listener port")
 	rootCmd.Flags().IntVar(&dnsPort, "dns-port", 5353, "DNS listener port")
 	rootCmd.Flags().StringVar(&domain, "domain", "canary.example.com", "Base domain for DNS callbacks")
-	rootCmd.Flags().StringVar(&serverIP, "ip", "", "Public IP to advertise in DNS A records (auto-detected if empty)")
+	rootCmd.Flags().StringVar(&serverIP, "ip", "127.0.0.1", "IPv4 address advertised in callback URLs and DNS A records")
 	rootCmd.Flags().BoolVar(&tlsEnabled, "tls", false, "Enable TLS for HTTP server")
 	rootCmd.Flags().StringVar(&certFile, "cert", "", "TLS certificate file (PEM)")
 	rootCmd.Flags().StringVar(&keyFile, "key", "", "TLS private key file (PEM)")
 }
 
 func run() error {
-	s := store.New()
+	adminToken := os.Getenv("CALLBACK_LEDGER_ADMIN_TOKEN")
+	if len(adminToken) < 32 {
+		return fmt.Errorf("set CALLBACK_LEDGER_ADMIN_TOKEN to at least 32 characters")
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("--ttl must be positive")
+	}
+	if ip := net.ParseIP(serverIP); ip == nil || ip.To4() == nil {
+		return fmt.Errorf("--ip requires an IPv4 address")
+	}
+	s := store.NewWithTTL(ttl)
 
 	cfg := server.Config{
 		HTTPPort:   httpPort,
@@ -61,7 +75,7 @@ func run() error {
 		Store:      s,
 	}
 
-	mux, hub := api.NewRouter(s, cfg.Domain, cfg.ServerIP, cfg.HTTPPort, cfg.TLSEnabled)
+	mux, hub := api.NewRouter(s, cfg.Domain, cfg.ServerIP, cfg.HTTPPort, cfg.TLSEnabled, adminToken)
 	cfg.Mux = mux
 	cfg.Hub = hub
 

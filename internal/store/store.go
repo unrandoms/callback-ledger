@@ -3,159 +3,162 @@ package store
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"sort"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
-// CallbackRequest holds details of a single incoming callback.
+var ErrCapacity = errors.New("token capacity reached")
+var ErrLabel = errors.New("label must be valid text of at most 128 bytes without control characters")
+
 type CallbackRequest struct {
-	Timestamp time.Time         `json:"timestamp"`
-	SourceIP  string            `json:"source_ip"`
-	Protocol  string            `json:"protocol"` // "http" or "dns"
-	Method    string            `json:"method,omitempty"`
-	Path      string            `json:"path,omitempty"`
-	Headers   map[string]string `json:"headers,omitempty"`
-	Body      string            `json:"body,omitempty"`
-	Query     string            `json:"query,omitempty"`
+	Timestamp     time.Time         `json:"timestamp"`
+	SourceIP      string            `json:"source_ip"`
+	Protocol      string            `json:"protocol"`
+	Method        string            `json:"method,omitempty"`
+	Path          string            `json:"path,omitempty"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	Body          string            `json:"body,omitempty"`
+	BodyTruncated bool              `json:"body_truncated"`
+	Query         string            `json:"query,omitempty"`
 }
 
-// TokenEntry tracks all callbacks received for a unique token.
 type TokenEntry struct {
 	Token     string            `json:"token"`
+	Label     string            `json:"label"`
 	CreatedAt time.Time         `json:"created_at"`
+	ExpiresAt time.Time         `json:"expires_at"`
 	Seen      bool              `json:"seen"`
+	Dropped   uint64            `json:"dropped_events"`
+	MaxEvents int               `json:"max_events"`
 	Requests  []CallbackRequest `json:"requests"`
 }
 
-// Store is a thread-safe in-memory token store.
 type Store struct {
-	mu     sync.RWMutex
-	tokens map[string]*TokenEntry
-	ttl    time.Duration
+	mu                   sync.RWMutex
+	tokens               map[string]*TokenEntry
+	ttl                  time.Duration
+	maxTokens, maxEvents int
 }
 
-// New creates a Store with a default TTL of 1 hour and starts background cleanup.
-func New() *Store {
-	s := &Store{
-		tokens: make(map[string]*TokenEntry),
-		ttl:    time.Hour,
-	}
-	go s.reapLoop()
-	return s
-}
-
-// NewWithTTL creates a Store with a custom TTL.
+func New() *Store { return NewWithTTL(time.Hour) }
 func NewWithTTL(ttl time.Duration) *Store {
-	s := &Store{
-		tokens: make(map[string]*TokenEntry),
-		ttl:    ttl,
-	}
-	go s.reapLoop()
-	return s
+	return &Store{tokens: make(map[string]*TokenEntry), ttl: ttl, maxTokens: 1024, maxEvents: 64}
 }
 
-// GenerateToken mints a new 16-byte hex token, stores it, and returns it.
-func (s *Store) GenerateToken() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// fallback: use time-based bytes (should never happen)
-		now := time.Now().UnixNano()
-		for i := range b {
-			b[i] = byte(now >> uint(i*8))
+// CreateToken allocates a bounded, expiring session. Randomness failures are returned.
+func (s *Store) CreateToken(label string) (string, error) {
+	if !utf8.ValidString(label) || len(label) > 128 {
+		return "", ErrLabel
+	}
+	for _, c := range label {
+		if unicode.IsControl(c) {
+			return "", ErrLabel
 		}
 	}
-	token := hex.EncodeToString(b)
-
 	s.mu.Lock()
-	s.tokens[token] = &TokenEntry{
-		Token:     token,
-		CreatedAt: time.Now(),
-		Requests:  []CallbackRequest{},
+	defer s.mu.Unlock()
+	s.reapLocked()
+	if len(s.tokens) >= s.maxTokens {
+		return "", ErrCapacity
 	}
-	s.mu.Unlock()
-	return token
+	for {
+		var b [16]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return "", err
+		}
+		token := hex.EncodeToString(b[:])
+		if _, exists := s.tokens[token]; exists {
+			continue
+		}
+		now := time.Now().UTC()
+		s.tokens[token] = &TokenEntry{Token: token, Label: label, CreatedAt: now, ExpiresAt: now.Add(s.ttl), MaxEvents: s.maxEvents, Requests: []CallbackRequest{}}
+		return token, nil
+	}
 }
 
-// Exists reports whether the token is tracked.
+// GenerateToken is retained for internal compatibility; an empty value signals failure.
+func (s *Store) GenerateToken() string { token, _ := s.CreateToken(""); return token }
+
 func (s *Store) Exists(token string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, ok := s.tokens[token]
-	return ok
+	e, ok := s.tokens[token]
+	return ok && time.Now().Before(e.ExpiresAt)
 }
 
-// RecordCallback logs a callback for the given token and marks it as seen.
-// Returns false if the token is not tracked.
+func cloneRequest(r CallbackRequest) CallbackRequest {
+	if r.Headers != nil {
+		headers := make(map[string]string, len(r.Headers))
+		for k, v := range r.Headers {
+			headers[k] = v
+		}
+		r.Headers = headers
+	}
+	return r
+}
+func cloneEntry(e *TokenEntry) TokenEntry {
+	cp := *e
+	cp.Requests = make([]CallbackRequest, len(e.Requests))
+	for i, r := range e.Requests {
+		cp.Requests[i] = cloneRequest(r)
+	}
+	return cp
+}
+
+// RecordCallback retains the first MaxEvents callbacks; overflow is counted.
 func (s *Store) RecordCallback(token string, req CallbackRequest) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entry, ok := s.tokens[token]
-	if !ok {
+	e, ok := s.tokens[token]
+	if !ok || !time.Now().Before(e.ExpiresAt) {
 		return false
 	}
-	entry.Seen = true
-	entry.Requests = append(entry.Requests, req)
+	e.Seen = true
+	if len(e.Requests) >= e.MaxEvents {
+		e.Dropped++
+		return false
+	}
+	e.Requests = append(e.Requests, cloneRequest(req))
 	return true
 }
-
-// Get returns a copy of the entry for the given token.
 func (s *Store) Get(token string) (TokenEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	entry, ok := s.tokens[token]
-	if !ok {
+	e, ok := s.tokens[token]
+	if !ok || !time.Now().Before(e.ExpiresAt) {
 		return TokenEntry{}, false
 	}
-	// Return a shallow copy to avoid races on the slice.
-	cp := *entry
-	cp.Requests = make([]CallbackRequest, len(entry.Requests))
-	copy(cp.Requests, entry.Requests)
-	return cp, true
+	return cloneEntry(e), true
 }
-
-// List returns copies of all token entries.
 func (s *Store) List() []TokenEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]TokenEntry, 0, len(s.tokens))
-	for _, entry := range s.tokens {
-		cp := *entry
-		cp.Requests = make([]CallbackRequest, len(entry.Requests))
-		copy(cp.Requests, entry.Requests)
-		out = append(out, cp)
+	now := time.Now()
+	for _, e := range s.tokens {
+		if now.Before(e.ExpiresAt) {
+			out = append(out, cloneEntry(e))
+		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].Token < out[j].Token
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
 	return out
 }
-
-// Clear removes all token entries.
-func (s *Store) Clear() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tokens = make(map[string]*TokenEntry)
-}
-
-// Delete removes a single token entry.
-func (s *Store) Delete(token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.tokens, token)
-}
-
-// reapLoop periodically removes expired entries.
-func (s *Store) reapLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-		s.reap()
-	}
-}
-
-func (s *Store) reap() {
-	cutoff := time.Now().Add(-s.ttl)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for token, entry := range s.tokens {
-		if entry.CreatedAt.Before(cutoff) {
+func (s *Store) Clear()              { s.mu.Lock(); defer s.mu.Unlock(); s.tokens = make(map[string]*TokenEntry) }
+func (s *Store) Delete(token string) { s.mu.Lock(); defer s.mu.Unlock(); delete(s.tokens, token) }
+func (s *Store) reap()               { s.mu.Lock(); defer s.mu.Unlock(); s.reapLocked() }
+func (s *Store) reapLocked() {
+	now := time.Now()
+	for token, e := range s.tokens {
+		if !now.Before(e.ExpiresAt) {
 			delete(s.tokens, token)
 		}
 	}

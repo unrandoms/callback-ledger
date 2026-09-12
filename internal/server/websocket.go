@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -22,9 +23,7 @@ func NewWSHub() *WSHub {
 	}
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
+var upgrader = websocket.Upgrader{}
 
 // ServeWS upgrades an HTTP connection to WebSocket and registers the client.
 func (h *WSHub) ServeWS(w http.ResponseWriter, r *http.Request) {
@@ -34,6 +33,7 @@ func (h *WSHub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.mu.Lock()
+	conn.SetReadLimit(1024)
 	h.clients[conn] = struct{}{}
 	h.mu.Unlock()
 
@@ -63,10 +63,13 @@ func (h *WSHub) Broadcast(event interface{}) {
 		log.Printf("[ws] marshal error: %v", err)
 		return
 	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	for conn := range h.clients {
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			delete(h.clients, conn)
+			conn.Close()
 			log.Printf("[ws] write error: %v", err)
 		}
 	}

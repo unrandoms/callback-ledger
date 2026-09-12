@@ -8,57 +8,49 @@ import (
 	"strings"
 	"time"
 
-	"github.com/unrandoms/ssrf-canary/internal/store"
+	"github.com/unrandoms/callback-ledger/internal/store"
 )
 
 // logAllRequests is middleware that logs every HTTP request and records callbacks.
 func logAllRequests(s *store.Store, hub *WSHub, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip internal API paths from callback matching but still log them.
+		// Management requests never enter the evidence capture path.
+		first := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)[0]
+		switch first {
+		case "token", "check", "list", "clear", "export", "ws":
+			next.ServeHTTP(w, r)
+			return
+		}
 		token := extractToken(r)
-
-		// Read body (limit to 64 KB to avoid memory abuse).
-		var bodyStr string
-		if r.Body != nil {
-			bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
-			if err == nil {
-				bodyStr = string(bodyBytes)
-			}
-			r.Body.Close()
-		}
-
-		sourceIP := r.RemoteAddr
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			sourceIP = strings.Split(fwd, ",")[0] + " (via " + r.RemoteAddr + ")"
-		}
-
-		log.Printf("[http] %s %s %s token=%q body_len=%d",
-			r.Method, r.URL.Path, sourceIP, token, len(bodyStr))
-
 		if token != "" && s.Exists(token) {
+			const bodyLimit = 16 * 1024
+			var body []byte
+			if r.Body != nil {
+				var err error
+				body, err = io.ReadAll(io.LimitReader(r.Body, bodyLimit+1))
+				r.Body.Close()
+				if err != nil {
+					http.Error(w, "unable to read callback", 400)
+					return
+				}
+			}
+			truncated := len(body) > bodyLimit
+			if truncated {
+				body = body[:bodyLimit]
+			}
 			headers := make(map[string]string)
 			for k, v := range r.Header {
-				headers[k] = strings.Join(v, ", ")
+				switch strings.ToLower(k) {
+				case "authorization", "proxy-authorization", "cookie":
+					headers[k] = "[redacted]"
+				default:
+					headers[k] = strings.Join(v, ", ")
+				}
 			}
-			cb := store.CallbackRequest{
-				Timestamp: time.Now(),
-				SourceIP:  r.RemoteAddr,
-				Protocol:  "http",
-				Method:    r.Method,
-				Path:      r.URL.Path,
-				Headers:   headers,
-				Body:      bodyStr,
-				Query:     r.URL.RawQuery,
+			cb := store.CallbackRequest{Timestamp: time.Now().UTC(), SourceIP: r.RemoteAddr, Protocol: "http", Method: r.Method, Path: r.URL.Path, Headers: headers, Body: string(body), BodyTruncated: truncated, Query: r.URL.RawQuery}
+			if s.RecordCallback(token, cb) {
+				hub.Broadcast(map[string]interface{}{"type": "callback", "token": token, "request": cb})
 			}
-			s.RecordCallback(token, cb)
-
-			event := map[string]interface{}{
-				"type":    "callback",
-				"token":   token,
-				"request": cb,
-			}
-			hub.Broadcast(event)
-			log.Printf("[http] token %s marked seen", token)
 		}
 
 		// Serve the actual handler.
@@ -108,11 +100,12 @@ func startHTTP(cfg Config) error {
 	addr := fmt.Sprintf(":%d", cfg.HTTPPort)
 	handler := logAllRequests(cfg.Store, cfg.Hub, cfg.Mux)
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:           addr,
+		Handler:        handler,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 16 * 1024,
 	}
 
 	if cfg.TLSEnabled {

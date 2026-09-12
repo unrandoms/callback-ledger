@@ -7,12 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/unrandoms/ssrf-canary/internal/store"
+	"github.com/unrandoms/callback-ledger/internal/store"
 )
 
 func newTestRouter() (*http.ServeMux, *store.Store) {
 	s := store.New()
-	mux, _ := NewRouter(s, "canary.example.com", "127.0.0.1", 8080, false)
+	mux, _ := NewRouter(s, "canary.example.com", "127.0.0.1", 8080, false, "test-admin")
 	return mux, s
 }
 
@@ -20,6 +20,7 @@ func TestTokenEndpoint(t *testing.T) {
 	mux, _ := newTestRouter()
 	req := httptest.NewRequest(http.MethodGet, "/token", nil)
 	rr := httptest.NewRecorder()
+	req.Header.Set("Authorization", "Bearer test-admin")
 	mux.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -45,6 +46,7 @@ func TestTokenEndpoint_wrongMethod(t *testing.T) {
 	mux, _ := newTestRouter()
 	req := httptest.NewRequest(http.MethodPost, "/token", nil)
 	rr := httptest.NewRecorder()
+	req.Header.Set("Authorization", "Bearer test-admin")
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405, got %d", rr.Code)
@@ -55,6 +57,7 @@ func TestCheckEndpoint_notFound(t *testing.T) {
 	mux, _ := newTestRouter()
 	req := httptest.NewRequest(http.MethodGet, "/check/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1", nil)
 	rr := httptest.NewRecorder()
+	req.Header.Set("Authorization", "Bearer test-admin")
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for unknown token, got %d", rr.Code)
@@ -70,6 +73,7 @@ func TestCheckEndpoint_seen(t *testing.T) {
 	// Check before callback — should be not seen.
 	req := httptest.NewRequest(http.MethodGet, "/check/"+tok, nil)
 	rr := httptest.NewRecorder()
+	req.Header.Set("Authorization", "Bearer test-admin")
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
@@ -86,6 +90,7 @@ func TestCheckEndpoint_seen(t *testing.T) {
 	// Check after callback — should be seen.
 	req2 := httptest.NewRequest(http.MethodGet, "/check/"+tok, nil)
 	rr2 := httptest.NewRecorder()
+	req2.Header.Set("Authorization", "Bearer test-admin")
 	mux.ServeHTTP(rr2, req2)
 	var resp2 checkResponse
 	json.NewDecoder(rr2.Body).Decode(&resp2)
@@ -104,6 +109,7 @@ func TestListEndpoint(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/list", nil)
 	rr := httptest.NewRecorder()
+	req.Header.Set("Authorization", "Bearer test-admin")
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
@@ -122,6 +128,7 @@ func TestClearEndpoint(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/clear", nil)
 	rr := httptest.NewRecorder()
+	req.Header.Set("Authorization", "Bearer test-admin")
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
